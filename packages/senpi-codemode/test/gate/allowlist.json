@@ -1466,6 +1466,7 @@
 				"legacyContracts/test/group-signal-notice.test.ts/process-group signal detection (senpi#2995) Given echo \"run kill -9 on the stuck pid\" when scanned then it is not a group signal",
 				"legacyContracts/test/group-signal-notice.test.ts/process-group signal detection (senpi#2995) Given echo \"use kill -9 1234 if needed\" when scanned then it is not a group signal",
 				"legacyContracts/test/group-signal-notice.test.ts/process-group signal detection (senpi#2995) Given echo killed -- -1 when scanned then it is not a group signal",
+				"legacyContracts/test/group-signal-notice.test.ts/process-group signal detection (senpi#2995) Given git log --grep kill foo -1 when scanned then it is not a group signal",
 				"legacyContracts/test/group-signal-notice.test.ts/process-group signal detection (senpi#2995) Given grep -c killall notes.txt when scanned then it is not a group signal",
 				"legacyContracts/test/group-signal-notice.test.ts/process-group signal detection (senpi#2995) Given kill $PID; head -5 log.txt when scanned then it is not a group signal",
 				"legacyContracts/test/group-signal-notice.test.ts/process-group signal detection (senpi#2995) Given kill -- -$$ when scanned then it is a group signal",
