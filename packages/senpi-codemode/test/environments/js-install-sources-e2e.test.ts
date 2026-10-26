@@ -2,17 +2,60 @@ import { execFileSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as jsInstaller from "../../src/environments/js-installer.ts";
 import { readActiveRevision } from "../../src/environments/revision-store.ts";
 import { hasCommand, packFixture, session, textOf } from "./js-magic-session.ts";
 
 const probeSource = 'export const probe = () => "ok";\n';
 const cleanupDirs: string[] = [];
 
+type PackageLock = { readonly packages: Record<string, { readonly resolved?: string }> };
+type PackageManifest = { readonly dependencies: Record<string, string> };
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		Object.values(value).every((entry) => typeof entry === "string")
+	);
+}
+
+function parsePackageLock(text: string): PackageLock {
+	const value: unknown = JSON.parse(text);
+	if (typeof value !== "object" || value === null || !("packages" in value))
+		throw new Error("package-lock has no packages");
+	const packages: unknown = value.packages;
+	if (typeof packages !== "object" || packages === null) throw new Error("package-lock packages is not an object");
+	const entries = Object.fromEntries(
+		Object.entries(packages).map(([key, entry]) => {
+			if (typeof entry !== "object" || entry === null) throw new Error(`package-lock entry ${key} is not an object`);
+			const resolved = "resolved" in entry && typeof entry.resolved === "string" ? { resolved: entry.resolved } : {};
+			return [key, resolved];
+		}),
+	);
+	return { packages: entries };
+}
+
+function parsePackageManifest(text: string): PackageManifest {
+	const value: unknown = JSON.parse(text);
+	if (typeof value !== "object" || value === null || !("dependencies" in value))
+		throw new Error("manifest has no dependencies");
+	if (!isStringRecord(value.dependencies)) throw new Error("manifest dependencies is not a string map");
+	return { dependencies: value.dependencies };
+}
+
+function listeningPort(address: ReturnType<ReturnType<typeof createServer>["address"]>): number {
+	if (typeof address !== "object" || address === null || !("port" in address) || typeof address.port !== "number")
+		throw new Error(`expected a bound TCP address, got ${JSON.stringify(address)}`);
+	return address.port;
+}
+
 afterEach(async () => {
+	vi.restoreAllMocks();
 	for (const dir of cleanupDirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 
@@ -102,31 +145,41 @@ describe.skipIf(!hasCommand("bun") || !hasCommand("npm"))("Given a package insta
 		const source = await packageDir(fixtures, "senpi-url-swap", 'export const which = () => "dir";\n');
 		const tarball = await packFixture(fixtures, "senpi-url-swap", "2.0.0", 'export const which = () => "tarball";\n');
 		const later = await packFixture(fixtures, "senpi-url-later", "1.0.0", probeSource);
-		// A URL names no package before the install, so nothing is removed first and only the post-build check stands
-		// between bun's leftover links (#2758) and the next revision.
+		// Bun 1.4.4 replaces the old directory cleanly. Recreate #2758's stale link after the real installer
+		// finishes, so this still proves the post-build refusal even when Bun no longer produces it (#4223).
+		const runJsInstall = jsInstaller.runJsInstall;
+		const install = vi.spyOn(jsInstaller, "runJsInstall").mockImplementation(async (input) => {
+			await runJsInstall(input);
+			if (input.remove !== undefined || !input.packages.some((spec) => spec.startsWith("http://"))) return;
+			const link = join(input.root, "node_modules", "senpi-url-swap", "index.js");
+			await rm(link);
+			await symlink(join(source, "index.js"), link);
+		});
 		const server = createServer((_request, response) => {
 			response.writeHead(200, { "content-type": "application/octet-stream" });
 			response.end(readFileSync(tarball));
 		});
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		try {
-			const { port } = server.address() as AddressInfo;
+			const port = listeningPort(server.address());
 			await run(`%bun add ${source}`);
 			const active = (await readActiveRevision(activeBase(root)))?.dir ?? "";
 			const before = tree(active);
 
 			const swap = await run(`%bun add http://127.0.0.1:${port}/senpi-url-swap-2.0.0.tgz`);
 			const imported = await run('const { which } = await import("senpi-url-swap");\nwhich()');
-			const next = await run(`%bun add ${later}`);
 
 			expect(swap.details).toHaveProperty("isError", true);
 			expect(textOf(swap)).toContain(
 				"the install left node_modules/senpi-url-swap/index.js linked outside the revision, so nothing was published",
 			);
 			expect(tree(active)).toEqual(before);
+			expect((await readActiveRevision(activeBase(root)))?.dir).toBe(active);
 			expect(textOf(imported).trim()).toBe('"dir"');
+			const next = await run(`%bun add ${later}`);
 			expect(next.details).not.toHaveProperty("isError", true);
 		} finally {
+			install.mockRestore();
 			server.close();
 		}
 	}, 240_000);
@@ -216,9 +269,7 @@ describe.skipIf(!hasCommand("bun") || !hasCommand("npm"))("Given a package insta
 		expect(textOf(imported).trim()).toBe('"three"');
 		// npm keys each package by its path and records where a link points; neither may name a staging directory, or the
 		// lockfile stops resolving once the staged revision is renamed.
-		const lock = JSON.parse(await readFile(join(revision, "package-lock.json"), "utf8")) as {
-			packages: Record<string, { resolved?: string }>;
-		};
+		const lock = parsePackageLock(await readFile(join(revision, "package-lock.json"), "utf8"));
 		const paths = Object.entries(lock.packages).flatMap(([key, entry]) => [key, entry.resolved ?? ""]);
 		expect(paths.filter((path) => path.includes(".staging-rev"))).toEqual([]);
 	}, 240_000);
@@ -265,18 +316,34 @@ describe.skipIf(!hasCommand("bun") || !hasCommand("npm"))("Given a package insta
 	it.each([["npm"], ["bun"]] as const)(
 		"When the directory %s installed from is deleted, then the next install is refused and the previous revision stays active",
 		async (installer) => {
-			const { root, fixtures, run } = await session(installer);
-			const source = await packageDir(fixtures, "senpi-dir-gone", probeSource);
-			const next = await packFixture(fixtures, "senpi-after-gone", "1.0.0", probeSource);
-			await run(`%${installer} add ${source}`);
-			const active = (await readActiveRevision(activeBase(root)))?.dir;
-			await rm(source, { recursive: true });
+			for (const plantLink of [false, true]) {
+				const { root, fixtures, run } = await session(installer);
+				const source = await packageDir(fixtures, "senpi-dir-gone", probeSource);
+				const next = await packFixture(fixtures, "senpi-after-gone", "1.0.0", probeSource);
+				const first = await run(`%${installer} add ${source}`);
+				expect(first.details).not.toHaveProperty("isError", true);
+				const active = (await readActiveRevision(activeBase(root)))?.dir ?? "";
+				if (plantLink) {
+					// Also exercise our dangling-link refusal regardless of the installer's link strategy (#4223).
+					const link = join(active, "node_modules", "senpi-dir-gone");
+					await rm(link, { recursive: true });
+					await symlink(source, link);
+				}
+				const before = tree(active);
+				await rm(source, { recursive: true });
 
-			const second = await run(`%${installer} add ${next}`);
+				const second = await run(`%${installer} add ${next}`);
 
-			expect(second.details).toHaveProperty("isError", true);
-			expect(textOf(second)).toContain("links outside its revision");
-			expect((await readActiveRevision(activeBase(root)))?.dir).toBe(active);
+				expect(second.details).toHaveProperty("isError", true);
+				expect(textOf(second)).toContain("environment_install_failed");
+				if (plantLink) expect(textOf(second)).toContain("links outside its revision");
+				// Bun 1.4.4 hardlinks local files; after deletion no dangling link remains. The installer fails
+				// on the missing source instead. Either failure must leave the previous revision untouched.
+				expect(textOf(second)).not.toContain(source);
+				expect(tree(active)).toEqual(before);
+				expect((await readActiveRevision(activeBase(root)))?.dir).toBe(active);
+				expect(readdirSync(activeBase(root)).some((name) => name.startsWith(".staging-"))).toBe(false);
+			}
 		},
 		240_000,
 	);
@@ -354,7 +421,7 @@ describe.skipIf(!hasCommand("bun") || !hasCommand("npm"))("Given a package insta
 		await run(`%npm add ${tarball}`);
 		const revision = (await readActiveRevision(activeBase(root)))?.dir ?? "";
 		const manifestPath = join(revision, "package.json");
-		const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as { dependencies: Record<string, string> };
+		const manifest = parsePackageManifest(await readFile(manifestPath, "utf8"));
 		delete manifest.dependencies["senpi-dir-forgotten"];
 		await writeFile(manifestPath, JSON.stringify(manifest));
 

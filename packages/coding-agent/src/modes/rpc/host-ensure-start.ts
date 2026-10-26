@@ -3,10 +3,10 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { open, readFile } from "node:fs/promises";
 import { engineBuildIdentity } from "../../core/engine-build-identity.ts";
-import { type DaemonPidFile, readProcessStartTime, waitForStartTime } from "../app-server/daemon/process.ts";
+import { type DaemonPidFile, readProcessStartTime, waitForStartTime } from "../../utils/process-identity.ts";
 import { generationPaths, type HostDaemonPaths } from "./host-daemon-paths.ts";
 import { clearHostRegistration, writeHostRegistration } from "./host-daemon-registration.ts";
-import { writeHostSettings } from "./host-daemon-state.ts";
+import { callerHostOwner, writeHostOwner, writeHostSettings } from "./host-daemon-state.ts";
 import { HOST_PROTOCOL_VERSION, REQUIRED_HOST_CAPABILITIES } from "./host-decision.ts";
 import { hostChildArgv, isCompatible } from "./host-ensure-client.ts";
 import {
@@ -24,10 +24,12 @@ import {
 import type { EnsuredHost, EnsureHostOptions } from "./host-ensure-types.ts";
 import { defaultHostLaunch, PINNED_HOST_CLIENT_CAPABILITIES } from "./host-launch.ts";
 import { DEFAULT_HOST_IDLE_EXIT_MS } from "./host-lifecycle.ts";
+import { keepOwnerPipe, OWNER_WATCH_FD } from "./host-lifecycle-launch.ts";
 import { type ChildExit, pollProtocolInfo } from "./host-readiness.ts";
 import { initialHostEnvironment } from "./host-spawn-environment.ts";
 import { hostLaunchProfile } from "./protocol-identity.ts";
 import { createSocketSecret, socketSecretPath } from "./socket-transport.ts";
+import { relayPresenterBootstrap } from "./mcp-presenter-bootstrap.ts";
 
 export const DEFAULT_READINESS_TIMEOUT_MS = 10_000;
 export { DEFAULT_STOP_TIMEOUT_MS };
@@ -43,6 +45,7 @@ export async function startHost(
 	generation = 0,
 ): Promise<EnsuredHost> {
 	const testOptions = options._test;
+	const lifetimeOwner = options.owner ? await callerHostOwner() : null;
 	// The generation this ensure is about to spawn, chosen HERE so its directory exists before the
 	// host boots and the pointer can name it the moment the host is registered.
 	const instanceId = randomUUID();
@@ -64,14 +67,23 @@ export async function startHost(
 		generation,
 		instanceId,
 	});
+	await writeHostOwner(generationPaths(paths, instanceId).dir, lifetimeOwner);
 	// A stranded generation is still writing its diagnostics here; only a fresh endpoint starts over.
 	const stderr = await open(paths.stderrLog, generation === 0 ? "w" : "a", 0o600);
 	let pidFile: DaemonPidFile | undefined;
 	let child: ReturnType<typeof spawn> | undefined;
 	let exitedEarly: ChildExit | undefined;
 	let childExit: Promise<ChildExit> | undefined;
+	let presenterEnrollment: Promise<void> | undefined;
 	try {
-		const supervisorArgs = ["--socket", socket, ...(options.hostArgs ?? [])];
+		const supervisorArgs = [
+			"--socket",
+			socket,
+			...(options.owner ? ["--owner-fd", String(OWNER_WATCH_FD)] : []),
+			...(options.presenterBootstrap ? ["--mcp-presenter-fd", "4"] : []),
+			...(options.mcpPresenterEnforcement ? ["--mcp-presenter-enforcement"] : []),
+			...(options.hostArgs ?? []),
+		];
 		const launch = testOptions?.spawn ?? testOptions?.launch?.(supervisorArgs) ?? defaultHostLaunch(supervisorArgs);
 		child = spawn(launch.command, [...launch.args], {
 			detached: true,
@@ -83,14 +95,20 @@ export async function startHost(
 				instanceId,
 				generation,
 			}),
-			stdio: ["ignore", "ignore", stderr.fd],
+			stdio: options.presenterBootstrap
+				? ["ignore", "ignore", stderr.fd, options.owner ? "pipe" : "ignore", "pipe"]
+				: options.owner
+					? ["ignore", "ignore", stderr.fd, "pipe"]
+					: ["ignore", "ignore", stderr.fd],
 		});
+		if (options.presenterBootstrap) presenterEnrollment = relayPresenterBootstrap(options.presenterBootstrap, child);
 		childExit = new Promise((resolveExit) => {
 			child!.once("exit", (code, signal) => {
 				exitedEarly = { code, signal };
 				resolveExit(exitedEarly);
 			});
 		});
+		if (options.owner) keepOwnerPipe(child);
 		if (child.pid === undefined) throw new Error("failed to spawn RPC socket host");
 		const probe = testOptions?.readProcessStartTime ?? readProcessStartTime;
 		const observedStartTime = await Promise.race([
@@ -148,7 +166,10 @@ export async function startHost(
 	}
 	const readinessTimeoutMs = testOptions?.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
 	const result = await pollProtocolInfo(socket, readinessTimeoutMs, isCompatible, childExit);
-	if (result.ready) return { pid: pidFile.pid, socket, reused: false, release: result.hold.release };
+	if (result.ready) {
+		await presenterEnrollment;
+		return { pid: pidFile.pid, socket, reused: false, release: result.hold.release };
+	}
 	await testOptions?.beforeReadinessTeardown?.();
 	// Teardown runs for the diagnostic's sake, so it must never replace it: a stop failure here
 	// (unreadable identity, a host that outlives SIGKILL) would otherwise propagate instead of the
